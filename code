@@ -1,0 +1,337 @@
+import re
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from PIL import Image
+
+
+# =========================
+# CONFIG
+# =========================
+DATA_PATH = "/Users/nikolaisukhinin/Downloads/missile_attacks_daily (1).csv"
+PLACE_LUT_PATH = "/Users/nikolaisukhinin/Desktop/Programming /final_vis/place_lut_filled.csv"
+
+OUT_DIR = Path("gif_frames")
+OUT_GIF = Path("missile_trajectories.gif")
+
+# Для GIF рекомендую "W" або "M"
+FRAME_FREQ = "W"          # "D" day, "W" week, "M" month
+
+# Плавність дуги (чим менше, тим легше)
+N_POINTS = 40
+
+# Межі карти (Україна + околиці)
+LAT_RANGE = (42, 53)
+LON_RANGE = (20, 45)
+
+# GIF параметри
+FRAME_DURATION_MS = 80    # 60..120
+LOOP = 0                  # 0 = loop forever
+
+# Ліміт подій (щоб GIF був підйомний)
+MAX_EVENTS = 4000         # None або число
+
+# Стиль
+LINE_COLOR = "#FFD54A"    # жовтий
+LINE_WIDTH = 1.1
+LINE_OPACITY = 0.55
+
+BG = "#000000"
+LAND = "#0B0B0B"
+COUNTRY = "#2A2A2A"
+SUBUNIT = "#1E1E1E"
+COAST = "#111111"
+TITLE_COLOR = "#E6E6E6"
+
+
+# =========================
+# TEXT HELPERS
+# =========================
+DIRECTIONAL_TRASH = {
+    "east", "west", "north", "south",
+    "north-east", "northeast", "north-west", "northwest",
+    "south-east", "southeast", "south-west", "southwest",
+    "eastern coast of sea of azov",
+}
+NULLISH = {"", "nan", "none", "null", "[null]"}
+
+def clean_text(x) -> str:
+    s = "" if x is None else str(x)
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.strip('"').strip("'").strip()
+    return s
+
+def normalize_place(p: str) -> str:
+    p = clean_text(p)
+    low = p.lower()
+
+    if low in NULLISH:
+        return ""
+    if low.startswith("and "):
+        p = p[4:].strip()
+        low = p.lower()
+    if low in DIRECTIONAL_TRASH:
+        return ""
+
+    # Уніфікуємо Crimean місця
+    if "crimea" in low:
+        return "Crimea"
+
+    # Типова опечатка
+    if p == "Dnipropetrovsk oblas":
+        return "Dnipropetrovsk oblast"
+
+    return p
+
+def split_places(raw: str) -> list[str]:
+    raw = clean_text(raw)
+    if raw.lower() in NULLISH:
+        return []
+
+    # split by "and"
+    parts = re.split(r"\s+and\s+", raw)
+    out = []
+    for part in parts:
+        part = clean_text(part)
+        if not part:
+            continue
+
+        # split by commas only if NOT "... , Crimea"
+        if ("," in part) and ("crimea" not in part.lower()):
+            out.extend([clean_text(x) for x in part.split(",") if clean_text(x)])
+        else:
+            out.append(part)
+
+    out = [normalize_place(x) for x in out]
+    out = [x for x in out if x]
+    return out
+
+
+# =========================
+# GREAT-CIRCLE (approx)
+# =========================
+def _to_unitvec(lat_deg, lon_deg):
+    lat = np.deg2rad(lat_deg)
+    lon = np.deg2rad(lon_deg)
+    x = np.cos(lat) * np.cos(lon)
+    y = np.cos(lat) * np.sin(lon)
+    z = np.sin(lat)
+    return np.array([x, y, z], dtype=float)
+
+def _from_unitvec(v):
+    x, y, z = v
+    lon = np.arctan2(y, x)
+    hyp = np.sqrt(x * x + y * y)
+    lat = np.arctan2(z, hyp)
+    return float(np.rad2deg(lat)), float(np.rad2deg(lon))
+
+def great_circle_points(lat1, lon1, lat2, lon2, n=40):
+    a = _to_unitvec(lat1, lon1)
+    b = _to_unitvec(lat2, lon2)
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+
+    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    omega = float(np.arccos(dot))
+
+    if np.isclose(omega, 0.0):
+        lats = np.linspace(lat1, lat2, n)
+        lons = np.linspace(lon1, lon2, n)
+        return lats, lons
+
+    sin_omega = np.sin(omega)
+    ts = np.linspace(0.0, 1.0, n)
+
+    lats = np.empty(n, dtype=float)
+    lons = np.empty(n, dtype=float)
+
+    for i, t in enumerate(ts):
+        v = (np.sin((1 - t) * omega) / sin_omega) * a + (np.sin(t * omega) / sin_omega) * b
+        v = v / np.linalg.norm(v)
+        lat, lon = _from_unitvec(v)
+        lats[i] = lat
+        lons[i] = lon
+
+    return lats, lons
+
+
+# =========================
+# LOAD DATA
+# =========================
+df = pd.read_csv(DATA_PATH)
+
+need_cols = ["time_end", "launch_place", "target_main", "model"]
+missing = [c for c in need_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing columns: {missing}. Available: {df.columns.tolist()}")
+
+df["time_end"] = pd.to_datetime(df["time_end"], errors="coerce")
+df = df.dropna(subset=["time_end"]).copy()
+
+for c in ["launch_place", "target_main", "model"]:
+    df[c] = df[c].map(clean_text)
+
+# split into lists
+df["launch_list"] = df["launch_place"].map(split_places)
+df["target_list"] = df["target_main"].map(split_places)
+
+# explode
+df2 = df.explode("launch_list").explode("target_list").copy()
+df2 = df2.rename(columns={"launch_list": "launch", "target_list": "target"})
+
+# --------- CRITICAL FIXES ----------
+df2 = df2.loc[:, ~df2.columns.duplicated()].copy()
+df2 = df2.reset_index(drop=True)
+
+df2["launch"] = df2["launch"].map(normalize_place)
+df2["target"] = df2["target"].map(normalize_place)
+
+mask = (df2["launch"].to_numpy() != "") & (df2["target"].to_numpy() != "")
+df2 = df2.loc[mask].copy()
+# ----------------------------------
+
+# optional: reduce events
+df2 = df2.sort_values("time_end")
+if MAX_EVENTS is not None and len(df2) > MAX_EVENTS:
+    df2 = df2.tail(MAX_EVENTS).copy()
+
+# =========================
+# LOAD LUT
+# =========================
+lut = pd.read_csv(PLACE_LUT_PATH)
+if not set(["place_key", "lat", "lon"]).issubset(lut.columns):
+    raise ValueError("place_lut_filled.csv must contain columns: place_key, lat, lon")
+
+lut["place_key"] = lut["place_key"].map(normalize_place)
+lut["lat"] = pd.to_numeric(lut["lat"], errors="coerce")
+lut["lon"] = pd.to_numeric(lut["lon"], errors="coerce")
+
+# =========================
+# JOIN COORDS
+# =========================
+geo = df2.merge(lut, left_on="launch", right_on="place_key", how="left") \
+         .rename(columns={"lat": "lat_launch", "lon": "lon_launch"}) \
+         .drop(columns=["place_key"])
+
+geo = geo.merge(lut, left_on="target", right_on="place_key", how="left") \
+         .rename(columns={"lat": "lat_target", "lon": "lon_target"}) \
+         .drop(columns=["place_key"])
+
+geo = geo.dropna(subset=["lat_launch", "lon_launch", "lat_target", "lon_target"]).copy()
+geo = geo.reset_index(drop=True)
+
+print(f"[INFO] Events with coords: {len(geo)}")
+if len(geo) == 0:
+    raise ValueError("No events after coord join. Check keys in place_lut_filled.csv.")
+
+# frame bucket
+geo["frame_time"] = geo["time_end"].dt.to_period(FRAME_FREQ).dt.start_time
+
+# =========================
+# BUILD TRACKS (points)
+# =========================
+tracks = []
+for r in geo.itertuples(index=False):
+    lats, lons = great_circle_points(r.lat_launch, r.lon_launch, r.lat_target, r.lon_target, n=N_POINTS)
+    tracks.append(pd.DataFrame({
+        "frame_time": r.frame_time,
+        "lat": lats,
+        "lon": lons
+    }))
+
+tracks = pd.concat(tracks, ignore_index=True)
+frame_times = sorted(tracks["frame_time"].unique())
+
+print(f"[INFO] Frames: {len(frame_times)} ({FRAME_FREQ})")
+
+# =========================
+# RENDER PNG FRAMES (CUMULATIVE)
+# =========================
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+for i, ft in enumerate(frame_times, start=1):
+    # 1) cumulative: все до поточного фрейму
+    dfi = tracks[tracks["frame_time"] <= ft]
+
+    lat_arr = dfi["lat"].to_numpy()
+    lon_arr = dfi["lon"].to_numpy()
+
+    # 2) one big polyline with breaks every N_POINTS
+    lats = []
+    lons = []
+    for k in range(0, len(lat_arr), N_POINTS):
+        lats.extend(lat_arr[k:k+N_POINTS].tolist())
+        lons.extend(lon_arr[k:k+N_POINTS].tolist())
+        lats.append(None)
+        lons.append(None)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scattergeo(
+        lat=lats,
+        lon=lons,
+        mode="lines",
+        line=dict(width=LINE_WIDTH, color=LINE_COLOR),
+        opacity=LINE_OPACITY,
+        hoverinfo="skip"
+    ))
+
+    # Night map styling
+    fig.update_geos(
+        lataxis_range=list(LAT_RANGE),
+        lonaxis_range=list(LON_RANGE),
+        projection_type="natural earth",
+        showland=True,
+        landcolor=LAND,
+        showocean=True,
+        oceancolor=BG,
+        showcountries=True,
+        countrycolor=COUNTRY,
+        showsubunits=True,
+        subunitcolor=SUBUNIT,
+        showlakes=True,
+        lakecolor=BG,
+        coastlinecolor=COAST,
+        bgcolor=BG
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=f"Trajectories (cumulative) — up to {pd.to_datetime(ft).date()}",
+            x=0.02, xanchor="left",
+            font=dict(color=TITLE_COLOR, size=20)
+        ),
+        paper_bgcolor=BG,
+        plot_bgcolor=BG,
+        margin=dict(l=0, r=0, t=60, b=0),
+        showlegend=False,
+        width=1100,
+        height=750
+    )
+
+    out_png = OUT_DIR / f"frame_{i:04d}.png"
+    fig.write_image(str(out_png), scale=2)
+
+    if i % 10 == 0 or i == len(frame_times):
+        print(f"[INFO] Rendered {i}/{len(frame_times)}")
+
+
+# =========================
+# PNG -> GIF
+# =========================
+png_files = sorted(OUT_DIR.glob("frame_*.png"))
+if not png_files:
+    raise RuntimeError("No PNG frames were created. Check kaleido installation.")
+
+images = [Image.open(p).convert("P", palette=Image.Palette.ADAPTIVE) for p in png_files]
+images[0].save(
+    OUT_GIF,
+    save_all=True,
+    append_images=images[1:],
+    duration=FRAME_DURATION_MS,
+    loop=LOOP,
+    optimize=False
+)
+
+print(f"[OK] Saved GIF: {OUT_GIF.resolve()}")
